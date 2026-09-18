@@ -3144,8 +3144,8 @@ void spawn_loop_recovery(server_slot & slot) {
         return;
     }
 
-    server_tokens phase1_tokens = tokenize_input_prompts(
-        vocab, mctx, recovery_prompt_str, true, true, init_opt)[0];
+    server_tokens phase1_tokens = std::move(tokenize_input_prompts(
+        vocab, mctx, recovery_prompt_str, true, true, init_opt)[0]);
 
     server_task phase1(SERVER_TASK_TYPE_COMPLETION);
     phase1.id                     = origin_id;
@@ -3179,8 +3179,8 @@ void spawn_loop_recovery(server_slot & slot) {
         resume_str += seed;
 
         // tokenize the phase 2 prompt
-        server_tokens phase2_tokens = tokenize_input_prompts(
-            vocab, mctx, resume_str, true, true, init_opt)[0];
+        server_tokens phase2_tokens = std::move(tokenize_input_prompts(
+            vocab, mctx, resume_str, true, true, init_opt)[0]);
 
         // build phase 2 task
         server_task phase2(SERVER_TASK_TYPE_COMPLETION);
