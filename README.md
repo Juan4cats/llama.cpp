@@ -1,3 +1,10 @@
+# 
+
+PERSONAL FORK OF LLAMA-SERVER.
+
+This fork attempts to implement a new method of loop recovery during inference. It uses n-gram similarity to detect loop mid generation and fires off a custom request to craft a recovery sentence appropriate for the task. The user can edit these instructions in the payload. The recovery sentence is appended to the loop, and the original generation is continued from there. 
+
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
