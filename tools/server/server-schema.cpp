@@ -532,6 +532,10 @@ task_params eval_llama_cmpl_schema(
     params.cache_prompt  = params_base.cache_prompt;
     params.antiprompt    = params_base.antiprompt;
     params.sse_ping_interval = params_base.sse_ping_interval;
+    params.loop_recovery_enabled    = json_value(data, "loop_recovery", false);
+    params.loop_recovery_max_tokens = json_value(data, "loop_recovery_max_tokens", -1);
+    params.loop_recovery_system_prompt = json_value(data, "loop_recovery_system_prompt", std::string());
+    params.loop_recovery_loop_notice   = json_value(data, "loop_recovery_loop_notice",   std::string());
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose       = params_base.verbosity > 9;

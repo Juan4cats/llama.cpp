@@ -67,6 +67,14 @@ struct task_params {
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
+    // ------------------------------------------------------------------
+    // Loop recovery
+    // ------------------------------------------------------------------
+    bool        loop_recovery_enabled     = false;  // opt-in per request
+    int32_t     loop_recovery_max_tokens  = -1;     // -1 = use server default
+    std::string loop_recovery_system_prompt;         // empty = use server default
+    std::string loop_recovery_loop_notice;           // empty = use server default    
+
     std::map<int, float> lora; // mapping adapter ID -> scale
 
     std::vector<std::string> antiprompt;
@@ -174,6 +182,14 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // ------------------------------------------------------------------
+    // Loop recovery chain
+    // ------------------------------------------------------------------
+    bool         is_recovery_phase1    = false; // this task is the recovery analysis
+    bool         is_recovery_phase2    = false; // this task is the resumed generation
+    llama_tokens recovery_resume_tokens;        // original prompt tokens, carried from phase1 to phase2
+    int          recovery_origin_id    = -1;    // original task id (the stream to keep writing to)
 
     server_task() = default;
 

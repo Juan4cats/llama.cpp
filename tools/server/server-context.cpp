@@ -36,6 +36,41 @@
 #include <windows.h>
 #endif
 
+// ------------------------------------------------------------------
+// 1.  User-facing variables — change these to tune the recovery prompt.
+//     These will eventually be exposed via the API.
+// ------------------------------------------------------------------
+ 
+// [VAR] System prompt that opens the recovery context.
+// Establishes the framing for the model receiving the recovery request.
+static const char * LOOP_RECOVERY_SYSTEM_PROMPT =
+    "You are an expert AI research assistant specializing in the study of "
+    "large language model behavior. You are helping analyze and recover from "
+    "a generation loop — a pathological state where a model repeatedly "
+    "produces the same or very similar output. Your role is to carefully "
+    "examine the context provided and assist in understanding and resolving "
+    "the loop.";
+ 
+// [VAR] Message appended after the looping assistant output.
+// Injected as a system turn (may fall back to user turn on some templates).
+// This is where you describe what happened and what you need.
+static const char * LOOP_RECOVERY_LOOP_NOTICE =
+    "The assistant output above has entered a generation loop. The looping "
+    "portion is clearly marked with the stop marker above. Please analyze "
+    "the context and the looping output, identify where and why the loop "
+    "began, and provide a well-reasoned continuation that breaks out of "
+    "the loop naturally.";
+ 
+// [VAR] Marker inserted at the end of the looping generated text.
+// Human-readable so the recovery model can see and reason about it.
+// Not an actual EOS token — we are in text space here.
+static const char * LOOP_RECOVERY_STOP_MARKER =
+    "\n\n[[ END OF LOOPING OUTPUT ]]\n\n";
+ 
+// [VAR] Maximum tokens the recovery generation is allowed to produce.
+// Exposed here for easy tuning; wire into the task params when sending.
+static constexpr int LOOP_RECOVERY_MAX_TOKENS = 1024;
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -824,6 +859,69 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     }
 
     return try_decode();
+}
+
+
+// ------------------------------------------------------------------
+// 2.  Data structures
+// ------------------------------------------------------------------
+
+// Lightweight snapshot of a slot's text state at the moment a
+// generation loop was detected. No KV blobs — text is all we need
+// to construct a recovery prompt that works across all architectures.
+struct loop_snapshot {
+    // which slot triggered the loop
+    int      id_slot       = -1;
+
+    // wall-clock timestamp (microseconds, from ggml_time_us)
+    int64_t  t_captured_us = 0;
+
+    // number of tokens in the slot's sequence at capture time
+    int32_t  n_tokens      = 0;
+
+    // the full generated text including the looping tail
+    std::string generated_text;
+
+    // the full token sequence (prompt + generated), used to reconstruct
+    // the original prompt text via detokenization
+    llama_tokens prompt_tokens;
+};
+
+// Thread-safe store for all snapshots made during one server run.
+// Access it via loop_snapshot_store_get() wherever you need to inspect
+// or drain the snapshots.
+struct loop_snapshot_store {
+    std::mutex                 mtx;
+    std::vector<loop_snapshot> snapshots;
+
+    // Maximum number of snapshots to keep in RAM.
+    // Oldest entries are dropped when the limit is reached.
+    static constexpr size_t MAX_SNAPSHOTS = 16;
+
+    void push(loop_snapshot && snap) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (snapshots.size() >= MAX_SNAPSHOTS) {
+            snapshots.erase(snapshots.begin());
+        }
+        snapshots.push_back(std::move(snap));
+    }
+
+    // Drain all snapshots out of the store (e.g. for processing / export).
+    std::vector<loop_snapshot> drain() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return std::move(snapshots);
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex &>(mtx));
+        return snapshots.size();
+    }
+};
+
+// Single process-wide instance.
+static loop_snapshot_store & loop_snapshot_store_get() {
+    static loop_snapshot_store instance;
+    return instance;
 }
 
 //
@@ -2759,6 +2857,346 @@ private:
             }
         }
     }
+    //
+    // N-gram loop detection
+    //
+
+    static constexpr int   LOOP_DETECT_WINDOW       = 300;
+    static constexpr int   LOOP_DETECT_NGRAM_MIN    = 4;
+    static constexpr int   LOOP_DETECT_NGRAM_MAX    = 50;
+    static constexpr float LOOP_DETECT_SIM_THRESH   = 0.75f; // minimum similarity to count as a hit
+    static constexpr int   LOOP_DETECT_MIN_HITS     = 3;     // minimum hit count to trigger
+    static constexpr int   LOOP_DETECT_CHECK_EVERY  = 10;    // only check every N generated tokens
+
+    struct ngram_freq_result {
+        int   ngram_size;
+        int   hit_count;   // number of positions in window with similarity >= threshold
+        float best_sim;    // highest similarity found across all positions
+        int   best_pos;    // position of that best match
+    };
+
+    // for each ngram size, use the tail ngram as the pattern and slide it across
+    // the window, counting how many positions have similarity >= threshold
+    static std::vector<ngram_freq_result> compute_ngram_hit_counts(
+            const llama_token * window,
+            int                 window_size,
+            int                 ngram_min,
+            int                 ngram_max,
+            float               sim_threshold) {
+
+        std::vector<ngram_freq_result> results;
+        results.reserve(ngram_max - ngram_min + 1);
+
+        for (int ng = ngram_min; ng <= ngram_max; ng++) {
+            // exclude the tail itself from the search window
+            const int n_pos = window_size - ng;
+            if (n_pos <= 0) {
+                continue;
+            }
+
+            // tail pattern: last ng tokens in the window
+            const llama_token * pattern = window + window_size - ng;
+
+            int   hit_count = 0;
+            float best_sim  = 0.0f;
+            int   best_pos  = -1;
+
+            for (int i = 0; i < n_pos; i++) {
+                int matches = 0;
+                for (int j = 0; j < ng; j++) {
+                    if (window[i + j] == pattern[j]) {
+                        matches++;
+                    }
+                }
+
+                const float sim = (float)matches / (float)ng;
+
+                if (sim >= sim_threshold) {
+                    hit_count++;
+                }
+
+                if (sim > best_sim) {
+                    best_sim = sim;
+                    best_pos = i;
+                }
+            }
+
+            results.push_back({ ng, hit_count, best_sim, best_pos });
+        }
+
+        return results;
+    }
+
+    static bool check_token_loop(
+            const server_slot & slot,
+            int                 window_size,
+            int                 ngram_min,
+            int                 ngram_max,
+            float               sim_threshold,
+            int                 min_hits) {
+
+        if (slot.stats.n_gen % LOOP_DETECT_CHECK_EVERY != 0) {
+            return false;
+        }
+
+        const auto toks = slot.prompt.tokens.get_tokens();
+
+        if ((int)toks.size() < window_size) {
+            return false;
+        }
+
+        const llama_token * window = toks.data() + (int)toks.size() - window_size;
+
+        const auto results = compute_ngram_hit_counts(
+                window, window_size, ngram_min, ngram_max, sim_threshold);
+
+        // log the full frequency table
+        for (const auto & r : results) {
+            if (r.hit_count > 0) {
+                SLT_TRC(slot, "ngram_size = %2d, hits = %3d, best_sim = %.2f, best_pos = %d\n",
+                        r.ngram_size, r.hit_count, r.best_sim, r.best_pos);
+            }
+        }
+
+        // trigger on any ngram size that has enough hits
+        for (const auto & r : results) {
+            if (r.hit_count >= min_hits) {
+                SLT_WRN(slot, "loop detected: ngram_size = %d, hits = %d (>= %d), best_sim = %.2f\n",
+                        r.ngram_size, r.hit_count, min_hits, r.best_sim);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    // ------------------------------------------------------------------
+    // 1.  Recovery prompt construction
+    // ------------------------------------------------------------------
+    //
+    // PLACEMENT: file scope, above struct server_context_impl.
+    //
+    // Takes a loop_snapshot and the server's loaded chat template, and
+    // returns a correctly-templated flat string ready to be tokenized
+    // and sent as a new completion request.
+    //
+    // Parameters:
+    //   snap                 — the captured loop snapshot
+    //   tmpls                — the chat templates for the loaded model
+    //                          (ctx_server.chat_params.tmpls.get())
+    //   use_jinja            — whether jinja templating is active
+    //                          (ctx_server.chat_params.use_jinja)
+    //   vocab                — the model vocab, used for detokenization
+    //                          (ctx_server.vocab)
+    //   recovery_system      — overrides LOOP_RECOVERY_SYSTEM_PROMPT if non-empty
+    //   recovery_loop_notice — overrides LOOP_RECOVERY_LOOP_NOTICE if non-empty
+    //   recovery_stop_marker — overrides LOOP_RECOVERY_STOP_MARKER if non-empty
+    //
+    // Returns an empty string on failure (logged internally).
+    // ------------------------------------------------------------------
+    
+    static std::string build_loop_recovery_prompt(
+            const loop_snapshot             & snap,
+            const common_chat_templates     * tmpls,
+            bool                              use_jinja,
+            const llama_vocab               * vocab,
+            const std::string               & recovery_system      = "",
+            const std::string               & recovery_loop_notice = "",
+            const std::string               & recovery_stop_marker = "") {
+    
+        // resolve variables — prefer caller-supplied overrides
+        const std::string & sys_prompt   = recovery_system.empty()
+            ? LOOP_RECOVERY_SYSTEM_PROMPT   : recovery_system;
+        const std::string & loop_notice  = recovery_loop_notice.empty()
+            ? LOOP_RECOVERY_LOOP_NOTICE     : recovery_loop_notice;
+        const std::string & stop_marker  = recovery_stop_marker.empty()
+            ? LOOP_RECOVERY_STOP_MARKER     : recovery_stop_marker;
+    
+        // --- reconstruct the original prompt text from the token sequence ---
+        // prompt_tokens is the flat rendered sequence (system + all turns up to
+        // the start of the current assistant turn). Detokenize it to get the
+        // full prior context as plain text.
+        std::string original_prompt_text;
+        {
+            original_prompt_text.reserve(snap.prompt_tokens.size() * 4); // rough estimate
+            for (const llama_token tok : snap.prompt_tokens) {
+                if (tok == LLAMA_TOKEN_NULL) {
+                    continue; // skip multimodal placeholders
+                }
+                original_prompt_text += common_token_to_piece(vocab, tok, true);
+            }
+        }
+    
+        // --- build the user message that carries the full prior context ---
+        // This bundles the entire original prompt (all previous turns already
+        // rendered by the chat template) plus the looping assistant output
+        // plus the stop marker, so the recovery model sees the complete picture.
+        const std::string user_context =
+            original_prompt_text
+            + snap.generated_text
+            + stop_marker;
+    
+        // --- assemble the message list ---
+        // [0] system  — recovery framing
+        // [1] user    — full prior context + looping output + stop marker
+        // [2] system  — loop notice and task description
+        //               (rendered as system if the template supports it mid-conversation,
+        //                otherwise the template will demote it gracefully or error —
+        //                callers can fall back to user role if needed)
+        std::vector<common_chat_msg> messages;
+        messages.reserve(3);
+    
+        messages.push_back({ "system", sys_prompt,  {} });
+        messages.push_back({ "user",   user_context, {} });
+        messages.push_back({ "system", loop_notice,  {} });
+    
+        // --- apply the model's chat template ---
+        common_chat_templates_inputs inputs;
+        inputs.messages        = messages;
+        inputs.add_generation_prompt = true; // open the assistant turn for completion
+    
+        try {
+            auto result = common_chat_templates_apply(tmpls, inputs);
+            return result.prompt;
+        } catch (const std::exception & e) {
+            LOG_ERR("build_loop_recovery_prompt: template apply failed: %s\n", e.what());
+            return "";
+        }
+    }
+    
+    
+    // ------------------------------------------------------------------
+    // 2.  Capture function  (PLACEMENT: inside server_context_impl)
+    // ------------------------------------------------------------------
+    //
+    // Add as a private member function of server_context_impl,
+    // alongside check_token_loop().
+    //
+    // Call sites in post_decode(): insert capture_loop_snapshot(slot)
+    // as the first line inside each if (check_token_loop(...)) block,
+    // before slot.stop = STOP_TYPE_LIMIT.
+    //
+    // ------------------------------------------------------------------
+    
+    void capture_loop_snapshot(const server_slot & slot) {
+        loop_snapshot snap;
+    
+        snap.id_slot        = slot.id;
+        snap.t_captured_us  = ggml_time_us();
+        snap.n_tokens       = slot.prompt.n_tokens();
+        snap.generated_text = slot.generated_text;
+        snap.prompt_tokens  = slot.prompt.tokens.get_tokens();
+    
+        SLT_INF(slot,
+            "loop snapshot captured: n_tokens=%d, generated_text_len=%zu, "
+            "store size=%zu\n",
+            snap.n_tokens,
+            snap.generated_text.size(),
+            loop_snapshot_store_get().size() + 1);
+    
+        loop_snapshot_store_get().push(std::move(snap));
+    }
+
+void spawn_loop_recovery(server_slot & slot) {
+    // respect per-request opt-in
+    if (!slot.task->params.loop_recovery_enabled) {
+        slot.stop           = STOP_TYPE_LIMIT;
+        slot.has_next_token = false;
+        slot.print_timings();
+        send_final_response(slot);
+        slot.release();
+        return;
+    }
+
+    // emit sentinel
+    completion_token_output sentinel;
+    sentinel.tok          = LLAMA_TOKEN_NULL;
+    sentinel.text_to_send = "\n\nLOOP RECOVERY IN PROGRESS\n\n";
+    sentinel.prob         = 1.0f;
+    send_partial_response(slot, sentinel, false);
+
+    const int          origin_id     = slot.task->id;
+    const int          origin_slot   = slot.id;
+    const llama_tokens resume_tokens = slot.prompt.tokens.get_tokens();
+
+    capture_loop_snapshot(slot);
+    const loop_snapshot snap = loop_snapshot_store_get().snapshots.back();
+
+    // resolve max tokens — per-request overrides server default
+    const int32_t max_tokens = slot.task->params.loop_recovery_max_tokens > 0
+        ? slot.task->params.loop_recovery_max_tokens
+        : LOOP_RECOVERY_MAX_TOKENS;
+
+    // build prompt, passing per-request string overrides
+    const std::string recovery_prompt_str = build_loop_recovery_prompt(
+        snap,
+        chat_params.tmpls.get(),
+        chat_params.use_jinja,
+        vocab,
+        slot.task->params.loop_recovery_system_prompt,
+        slot.task->params.loop_recovery_loop_notice);
+
+    if (recovery_prompt_str.empty()) {
+        SLT_ERR(slot, "%s", "loop recovery: failed to build recovery prompt\n");
+        send_final_response(slot);
+        slot.release();
+        return;
+    }
+
+    server_tokens phase1_tokens = tokenize_input_prompts(
+        vocab, mctx, recovery_prompt_str, true, true, init_opt)[0];
+
+    server_task phase1(SERVER_TASK_TYPE_COMPLETION);
+    phase1.id                     = origin_id;
+    phase1.id_slot                = origin_slot;
+    phase1.tokens                 = std::move(phase1_tokens);
+    phase1.params                 = slot.task->params;
+    phase1.params.n_predict       = max_tokens;
+    phase1.params.stream          = true;
+    phase1.is_recovery_phase1     = true;
+    phase1.recovery_resume_tokens = resume_tokens;
+    phase1.recovery_origin_id     = origin_id;
+
+    queue_tasks.defer(std::move(phase1));
+    slot.release();
+}
+
+    void spawn_loop_recovery_phase2(server_slot & slot) {
+        // the seed is whatever phase 1 generated
+        const std::string seed = slot.generated_text;
+
+        // reconstruct the resume context:
+        // original prompt tokens detokenized + phase 1 seed appended
+        std::string resume_str;
+        resume_str.reserve(slot.task->recovery_resume_tokens.size() * 4);
+        for (const llama_token tok : slot.task->recovery_resume_tokens) {
+            if (tok == LLAMA_TOKEN_NULL) {
+                continue;
+            }
+            resume_str += common_token_to_piece(vocab, tok, true);
+        }
+        resume_str += seed;
+
+        // tokenize the phase 2 prompt
+        server_tokens phase2_tokens = tokenize_input_prompts(
+            vocab, mctx, resume_str, true, true, init_opt)[0];
+
+        // build phase 2 task
+        server_task phase2(SERVER_TASK_TYPE_COMPLETION);
+        phase2.id                  = slot.task->recovery_origin_id;  // same stream
+        phase2.id_slot             = slot.id;                        // same slot
+        phase2.tokens              = std::move(phase2_tokens);
+        phase2.params              = slot.task->params;
+        phase2.params.stream       = true;
+        phase2.is_recovery_phase2  = true;                           // marks final leg
+        phase2.recovery_origin_id  = slot.task->recovery_origin_id;
+
+        queue_tasks.defer(std::move(phase2));
+
+        // release without closing the stream
+        slot.release();
+    }
 
     // @ngxson : for debugging only
     int64_t t_pre_decode  = 0;
@@ -3883,15 +4321,37 @@ private:
             }
 
             if (!process_token(result, slot)) {
-                // release slot because of stop condition
                 slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
+                if (slot.task->is_recovery_phase1) {
+                    // phase 1 finished naturally — spawn phase 2
+                    spawn_loop_recovery_phase2(slot);
+                } else {
+                    send_final_response(slot);
+                    slot.release();
+                }
                 return;
             }
 
-            slot.print_timings_tg();
+            if (check_token_loop(slot,
+                    LOOP_DETECT_WINDOW,
+                    LOOP_DETECT_NGRAM_MIN,
+                    LOOP_DETECT_NGRAM_MAX,
+                    LOOP_DETECT_SIM_THRESH,
+                    LOOP_DETECT_MIN_HITS)) {
+                // only trigger recovery on original tasks, not on recovery tasks themselves
+                if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+                    slot.print_timings();
+                    spawn_loop_recovery(slot);
+                    return;
+                }
+                // recovery task itself looped — just stop cleanly
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
+                slot.print_timings();
+                send_final_response(slot);
+                slot.release();
+                return;
+            }
         });
 
         // speculative decoding - main model sample and accept
@@ -4010,9 +4470,34 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    if (slot.task->is_recovery_phase1) {
+                        // phase 1 finished naturally — spawn phase 2
+                        spawn_loop_recovery_phase2(slot);
+                    } else {
+                        send_final_response(slot);
+                        slot.release();
+                    }
+                    return;
+                }
+
+                if (check_token_loop(slot,
+                        LOOP_DETECT_WINDOW,
+                        LOOP_DETECT_NGRAM_MIN,
+                        LOOP_DETECT_NGRAM_MAX,
+                        LOOP_DETECT_SIM_THRESH,
+                        LOOP_DETECT_MIN_HITS)) {
+                    // only trigger recovery on original tasks, not on recovery tasks themselves
+                    if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+                        slot.print_timings();
+                        spawn_loop_recovery(slot);
+                        return;
+                    }
+                    // recovery task itself looped — just stop cleanly
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    slot.print_timings();
                     send_final_response(slot);
                     slot.release();
-
                     return;
                 }
             }
