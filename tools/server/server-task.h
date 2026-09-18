@@ -75,6 +75,12 @@ struct task_params {
     std::string loop_recovery_system_prompt;         // empty = use server default
     std::string loop_recovery_loop_notice;           // empty = use server default    
 
+    // loop detection tuning — -1 or 0 means use server default
+    int32_t loop_detect_ngram_min  = -1;
+    int32_t loop_detect_ngram_max  = -1;
+    float   loop_detect_sim_thresh = -1.0f;
+    int32_t loop_detect_min_hits   = -1;
+
     std::map<int, float> lora; // mapping adapter ID -> scale
 
     std::vector<std::string> antiprompt;

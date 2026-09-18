@@ -71,6 +71,18 @@ static const char * LOOP_RECOVERY_STOP_MARKER =
 // Exposed here for easy tuning; wire into the task params when sending.
 static constexpr int LOOP_RECOVERY_MAX_TOKENS = 1024;
 
+// [VAR] Minimum n-gram size for loop detection.
+static constexpr int LOOP_DETECT_NGRAM_MIN_DEFAULT    = 4;
+
+// [VAR] Maximum n-gram size for loop detection.
+static constexpr int LOOP_DETECT_NGRAM_MAX_DEFAULT    = 50;
+
+// [VAR] Minimum similarity to count a position as a hit (0.0 - 1.0).
+static constexpr float LOOP_DETECT_SIM_THRESH_DEFAULT = 0.75f;
+
+// [VAR] Minimum number of hits across the window to trigger recovery.
+static constexpr int LOOP_DETECT_MIN_HITS_DEFAULT     = 3;
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -1033,6 +1045,11 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    int   loop_detect_ngram_min  (const server_slot & slot) const { return slot.task->params.loop_detect_ngram_min  > 0    ? slot.task->params.loop_detect_ngram_min  : LOOP_DETECT_NGRAM_MIN_DEFAULT;  }
+    int   loop_detect_ngram_max  (const server_slot & slot) const { return slot.task->params.loop_detect_ngram_max  > 0    ? slot.task->params.loop_detect_ngram_max  : LOOP_DETECT_NGRAM_MAX_DEFAULT;  }
+    float loop_detect_sim_thresh (const server_slot & slot) const { return slot.task->params.loop_detect_sim_thresh >= 0.0f ? slot.task->params.loop_detect_sim_thresh : LOOP_DETECT_SIM_THRESH_DEFAULT; }
+    int   loop_detect_min_hits   (const server_slot & slot) const { return slot.task->params.loop_detect_min_hits   > 0    ? slot.task->params.loop_detect_min_hits   : LOOP_DETECT_MIN_HITS_DEFAULT;   }
+    
     void destroy() {
         spec.reset();
         spec_init.reset();
@@ -2862,10 +2879,6 @@ private:
     //
 
     static constexpr int   LOOP_DETECT_WINDOW       = 300;
-    static constexpr int   LOOP_DETECT_NGRAM_MIN    = 4;
-    static constexpr int   LOOP_DETECT_NGRAM_MAX    = 50;
-    static constexpr float LOOP_DETECT_SIM_THRESH   = 0.75f; // minimum similarity to count as a hit
-    static constexpr int   LOOP_DETECT_MIN_HITS     = 3;     // minimum hit count to trigger
     static constexpr int   LOOP_DETECT_CHECK_EVERY  = 10;    // only check every N generated tokens
 
     struct ngram_freq_result {
@@ -3079,36 +3092,27 @@ private:
     //
     // ------------------------------------------------------------------
     
-    void capture_loop_snapshot(const server_slot & slot) {
+    loop_snapshot capture_loop_snapshot(const server_slot & slot) {
         loop_snapshot snap;
-    
+
         snap.id_slot        = slot.id;
         snap.t_captured_us  = ggml_time_us();
         snap.n_tokens       = slot.prompt.n_tokens();
         snap.generated_text = slot.generated_text;
         snap.prompt_tokens  = slot.prompt.tokens.get_tokens();
-    
+
         SLT_INF(slot,
             "loop snapshot captured: n_tokens=%d, generated_text_len=%zu, "
             "store size=%zu\n",
             snap.n_tokens,
             snap.generated_text.size(),
             loop_snapshot_store_get().size() + 1);
-    
-        loop_snapshot_store_get().push(std::move(snap));
+
+        loop_snapshot_store_get().push(loop_snapshot(snap)); // push a copy
+        return snap;                                          // return the original
     }
 
 void spawn_loop_recovery(server_slot & slot) {
-    // respect per-request opt-in
-    if (!slot.task->params.loop_recovery_enabled) {
-        slot.stop           = STOP_TYPE_LIMIT;
-        slot.has_next_token = false;
-        slot.print_timings();
-        send_final_response(slot);
-        slot.release();
-        return;
-    }
-
     // emit sentinel
     completion_token_output sentinel;
     sentinel.tok          = LLAMA_TOKEN_NULL;
@@ -3120,8 +3124,7 @@ void spawn_loop_recovery(server_slot & slot) {
     const int          origin_slot   = slot.id;
     const llama_tokens resume_tokens = slot.prompt.tokens.get_tokens();
 
-    capture_loop_snapshot(slot);
-    const loop_snapshot snap = loop_snapshot_store_get().snapshots.back();
+    const loop_snapshot snap = capture_loop_snapshot(slot);
 
     // resolve max tokens — per-request overrides server default
     const int32_t max_tokens = slot.task->params.loop_recovery_max_tokens > 0
@@ -4332,26 +4335,30 @@ void spawn_loop_recovery(server_slot & slot) {
                 return;
             }
 
-            if (check_token_loop(slot,
-                    LOOP_DETECT_WINDOW,
-                    LOOP_DETECT_NGRAM_MIN,
-                    LOOP_DETECT_NGRAM_MAX,
-                    LOOP_DETECT_SIM_THRESH,
-                    LOOP_DETECT_MIN_HITS)) {
-                // only trigger recovery on original tasks, not on recovery tasks themselves
-                if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+            if (slot.task->params.loop_recovery_enabled) {
+                if (check_token_loop(slot,
+                        LOOP_DETECT_WINDOW,
+                        loop_detect_ngram_min(slot),
+                        loop_detect_ngram_max(slot),
+                        loop_detect_sim_thresh(slot),
+                        loop_detect_min_hits(slot))) {
+                    // only trigger recovery on original tasks, not on recovery tasks themselves
+                    if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+                        slot.print_timings();
+                        spawn_loop_recovery(slot);
+                        return;
+                    }
+                    // recovery task itself looped — just stop cleanly
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
                     slot.print_timings();
-                    spawn_loop_recovery(slot);
+                    send_final_response(slot);
+                    slot.release();
                     return;
                 }
-                // recovery task itself looped — just stop cleanly
-                slot.stop           = STOP_TYPE_LIMIT;
-                slot.has_next_token = false;
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-                return;
             }
+
+            
         });
 
         // speculative decoding - main model sample and accept
@@ -4479,26 +4486,27 @@ void spawn_loop_recovery(server_slot & slot) {
                     }
                     return;
                 }
-
-                if (check_token_loop(slot,
-                        LOOP_DETECT_WINDOW,
-                        LOOP_DETECT_NGRAM_MIN,
-                        LOOP_DETECT_NGRAM_MAX,
-                        LOOP_DETECT_SIM_THRESH,
-                        LOOP_DETECT_MIN_HITS)) {
-                    // only trigger recovery on original tasks, not on recovery tasks themselves
-                    if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+                if (slot.task->params.loop_recovery_enabled) {
+                    if (check_token_loop(slot,
+                            LOOP_DETECT_WINDOW,
+                            loop_detect_ngram_min(slot),
+                            loop_detect_ngram_max(slot),
+                            loop_detect_sim_thresh(slot),
+                            loop_detect_min_hits(slot))) {
+                        // only trigger recovery on original tasks, not on recovery tasks themselves
+                        if (!slot.task->is_recovery_phase1 && !slot.task->is_recovery_phase2) {
+                            slot.print_timings();
+                            spawn_loop_recovery(slot);
+                            return;
+                        }
+                        // recovery task itself looped — just stop cleanly
+                        slot.stop           = STOP_TYPE_LIMIT;
+                        slot.has_next_token = false;
                         slot.print_timings();
-                        spawn_loop_recovery(slot);
+                        send_final_response(slot);
+                        slot.release();
                         return;
                     }
-                    // recovery task itself looped — just stop cleanly
-                    slot.stop           = STOP_TYPE_LIMIT;
-                    slot.has_next_token = false;
-                    slot.print_timings();
-                    send_final_response(slot);
-                    slot.release();
-                    return;
                 }
             }
 

@@ -536,6 +536,10 @@ task_params eval_llama_cmpl_schema(
     params.loop_recovery_max_tokens = json_value(data, "loop_recovery_max_tokens", -1);
     params.loop_recovery_system_prompt = json_value(data, "loop_recovery_system_prompt", std::string());
     params.loop_recovery_loop_notice   = json_value(data, "loop_recovery_loop_notice",   std::string());
+    params.loop_detect_ngram_min  = json_value(data, "loop_detect_ngram_min",  -1);
+    params.loop_detect_ngram_max  = json_value(data, "loop_detect_ngram_max",  -1);
+    params.loop_detect_sim_thresh = json_value(data, "loop_detect_sim_thresh", -1.0f);
+    params.loop_detect_min_hits   = json_value(data, "loop_detect_min_hits",   -1);
 
     // enabling this will output extra debug information in the HTTP responses from the server
     params.verbose       = params_base.verbosity > 9;
@@ -570,6 +574,15 @@ task_params eval_llama_cmpl_schema(
                 params.sampling.reasoning_budget_end.size(),
                 params.sampling.reasoning_budget_forced.size());
     }
+
+    // debug: print loop recovery params
+    fprintf(stderr, "[loop-recovery] enabled=%d, max_tokens=%d, ngram_min=%d, ngram_max=%d, sim_thresh=%.2f, min_hits=%d\n",
+        (int) params.loop_recovery_enabled,
+        params.loop_recovery_max_tokens,
+        params.loop_detect_ngram_min,
+        params.loop_detect_ngram_max,
+        params.loop_detect_sim_thresh,
+        params.loop_detect_min_hits);
 
     return params;
 }
